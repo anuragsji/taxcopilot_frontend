@@ -265,8 +265,17 @@ export default function App() {
   const [phoneInput, setPhoneInput] = useState<string>('');
   const [otpInput, setOtpInput] = useState<string>('');
   const [otpRequested, setOtpRequested] = useState<boolean>(false);
+  const [otpInfoMessage, setOtpInfoMessage] = useState<string>('');
   const [authError, setAuthError] = useState<string>('');
   const [authLoading, setAuthLoading] = useState<boolean>(false);
+  const otpInputRef = useRef<HTMLInputElement>(null);
+  
+  // Email correction flow (for users with auto-generated @gemini.in emails)
+  const [showEmailCorrection, setShowEmailCorrection] = useState<boolean>(false);
+  const [emailCorrectionInput, setEmailCorrectionInput] = useState<string>('');
+  const [emailCorrectionError, setEmailCorrectionError] = useState<string>('');
+  const [emailCorrectionLoading, setEmailCorrectionLoading] = useState<boolean>(false);
+  const [emailCorrectionUserId, setEmailCorrectionUserId] = useState<string>('');
   
   // OTP Profile Completion (shown after OTP verification if phone not in users table)
   const [showOtpProfile, setShowOtpProfile] = useState<boolean>(false);
@@ -614,7 +623,9 @@ export default function App() {
       
       if (res.ok && data.success) {
         setOtpRequested(true);
-        alert(`OTP sent to your WhatsApp. Please check your phone and enter the OTP.`);
+        setOtpInfoMessage('OTP sent to your WhatsApp. Please check your phone and enter the OTP.');
+        // Auto-focus OTP input after render
+        setTimeout(() => otpInputRef.current?.focus(), 100);
       } else {
         throw new Error(data.message || 'OTP transmission failed');
       }
@@ -645,12 +656,24 @@ export default function App() {
         const phoneCheck = await fetch(`http://localhost:5002/api/user-by-phone?phone=91${phoneInput}`);
         const phoneData = await phoneCheck.json();
         
-        if (phoneData.success && phoneData.exists && phoneData.user) {
-          // User exists → log them in directly
-          saveSession(`jwt_otp_${phoneData.user.id}_${Date.now()}`, phoneData.user);
-        } else {
-          // User does NOT exist → show profile completion screen
+        if (phoneCheck.ok && phoneData.success && phoneData.exists && phoneData.user) {
+          // Check if user has auto-generated @gemini.in email that needs correction
+          const userEmail = phoneData.user.email || '';
+          if (userEmail.endsWith('@gemini.in') && userEmail.startsWith('mobile_')) {
+            // Show email correction flow
+            setEmailCorrectionUserId(phoneData.user.id);
+            setShowEmailCorrection(true);
+            setOtpInfoMessage('');
+          } else {
+            // User exists with valid email → log them in directly
+            saveSession(`jwt_otp_${phoneData.user.id}_${Date.now()}`, phoneData.user);
+          }
+        } else if (phoneCheck.ok && phoneData.success && !phoneData.exists) {
+          // User genuinely does NOT exist → show profile completion screen
           setShowOtpProfile(true);
+        } else {
+          // API error — don't show registration, show error instead
+          throw new Error(phoneData.message || 'Failed to verify phone registration. Please try again.');
         }
       } else {
         throw new Error(data.message || 'OTP Verification failed');
@@ -659,6 +682,60 @@ export default function App() {
       setAuthError(err.message || 'Failed to verify OTP. Please check the OTP and try again.');
     } finally {
       setAuthLoading(false);
+    }
+  };
+
+  // Handle email correction for users with auto-generated @gemini.in emails
+  const handleEmailCorrection = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setEmailCorrectionError('');
+    setEmailCorrectionLoading(true);
+
+    const newEmail = emailCorrectionInput.trim().toLowerCase();
+
+    // Validate email format
+    if (!newEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      setEmailCorrectionError('Please enter a valid email address.');
+      setEmailCorrectionLoading(false);
+      return;
+    }
+
+    // Reject @gemini.in emails
+    if (newEmail.endsWith('@gemini.in')) {
+      setEmailCorrectionError('Please enter a real email address (not @gemini.in).');
+      setEmailCorrectionLoading(false);
+      return;
+    }
+
+    try {
+      // Check if email is already taken
+      const checkRes = await fetch(`http://localhost:5002/api/user?email=${encodeURIComponent(newEmail)}`);
+      if (checkRes.ok) {
+        setEmailCorrectionError('This email is already registered. Please enter a different email.');
+        setEmailCorrectionLoading(false);
+        return;
+      }
+
+      // Update user's email in Supabase
+      const updateRes = await fetch('http://localhost:5002/api/update-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: emailCorrectionUserId, new_email: newEmail })
+      });
+
+      const updateData = await updateRes.json();
+      if (updateRes.ok && updateData.success) {
+        // Email updated — log user in
+        saveSession(`jwt_otp_${updateData.user.id}_${Date.now()}`, updateData.user);
+        setShowEmailCorrection(false);
+        setEmailCorrectionInput('');
+      } else {
+        throw new Error(updateData.message || 'Failed to update email.');
+      }
+    } catch (err: any) {
+      setEmailCorrectionError(err.message || 'Failed to update email. Please try again.');
+    } finally {
+      setEmailCorrectionLoading(false);
     }
   };
 
@@ -823,7 +900,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: user.email,
-          phone_number: user.phoneNumber || null,
+          phone_number: user.phoneNumber || user.phone_number || null,
           first_name: user.first_name,
           last_name: user.last_name,
           auth_provider: authProvider
@@ -1633,17 +1710,23 @@ export default function App() {
                         {t.auth.getOTP}
                       </button>
                     </div>
+                    {otpInfoMessage && (
+                      <p style={{ margin: '6px 0 0', fontSize: '12px', color: '#3b82f6', fontWeight: 500 }}>
+                        {otpInfoMessage}
+                      </p>
+                    )}
                   </div>
-                  {otpRequested && (
+                  {otpRequested && !showEmailCorrection && (
                     <form onSubmit={handleVerifyOTP} className="float-ui" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                       <div className="input-group">
                         <label className="input-label">{t.auth.verifyOTP}</label>
                         <input 
+                          ref={otpInputRef}
                           type="text" 
                           required
                           maxLength={6}
                           autoComplete="off"
-                          placeholder="Check console or enter 123456"
+                          placeholder=""
                           value={otpInput} 
                           onChange={(e) => setOtpInput(e.target.value)} 
                           className="input-field" 
@@ -1652,6 +1735,50 @@ export default function App() {
                       </div>
                       <button type="submit" disabled={authLoading} className="btn btn-success" style={{ width: '100%' }}>
                         {authLoading ? t.general.loading : t.auth.verifyOTP}
+                      </button>
+                    </form>
+                  )}
+
+                  {/* EMAIL CORRECTION FLOW (for @gemini.in auto-generated emails) */}
+                  {showEmailCorrection && (
+                    <form onSubmit={handleEmailCorrection} className="float-ui" style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '8px', padding: '20px', background: 'var(--surface)', borderRadius: '12px', border: '1px solid var(--border)' }}>
+                      <div style={{ textAlign: 'center', marginBottom: '8px' }}>
+                        <CheckCircle size={28} style={{ color: 'var(--success)', marginBottom: '8px' }} />
+                        <h3 style={{ margin: 0, fontSize: '16px', color: 'var(--text-primary)' }}>OTP Verified Successfully</h3>
+                        <p style={{ margin: '6px 0 0', fontSize: '12px', color: 'var(--text-muted)' }}>
+                          Please enter a valid email address to update your profile
+                        </p>
+                      </div>
+                      
+                      {emailCorrectionError && (
+                        <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', borderRadius: '6px', fontSize: '12px', color: 'var(--danger)' }}>
+                          {emailCorrectionError}
+                        </div>
+                      )}
+                      
+                      <div className="input-group">
+                        <label className="input-label">
+                          Email Address <span style={{ color: 'var(--danger)' }}>*</span>
+                        </label>
+                        <div style={{ position: 'relative' }}>
+                          <Mail size={14} style={{ position: 'absolute', left: '12px', top: '13px', color: 'var(--text-muted)' }} />
+                          <input 
+                            type="email" 
+                            required
+                            maxLength={254}
+                            autoComplete="off"
+                            autoFocus
+                            placeholder="your.real.email@example.com"
+                            value={emailCorrectionInput} 
+                            onChange={(e) => { setEmailCorrectionInput(sanitizeEmail(e.target.value)); setEmailCorrectionError(''); }}
+                            className="input-field" 
+                            style={{ width: '100%', paddingLeft: '36px' }}
+                          />
+                        </div>
+                      </div>
+                      
+                      <button type="submit" disabled={emailCorrectionLoading} className="btn btn-primary" style={{ width: '100%', marginTop: '4px' }}>
+                        {emailCorrectionLoading ? t.general.loading : 'Update Email & Continue'}
                       </button>
                     </form>
                   )}
